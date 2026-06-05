@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime
 
 # Set up page configuration
 st.set_page_config(page_title="SF Historic Demolition Finder", layout="wide")
@@ -26,7 +25,7 @@ status_options = ['filed', 'issued', 'approved', 'reinstated', 'cancelled', 'wit
 selected_statuses = st.sidebar.multiselect("Permit Statuses", options=status_options, default=['filed', 'issued', 'approved'])
 
 # --- DATA FETCHING & PROCESSING ---
-@st.cache_data(ttl=3600)  # Cache data for 1 hour to keep it fast
+@st.cache_data(ttl=3600)  # Cache data for 1 hour
 def fetch_sf_data(statuses, keywords, max_built_year):
     # Fetch Demolition Permits
     permits_url = "https://data.sfgov.org/resource/i98e-djp9.json"
@@ -62,6 +61,90 @@ def fetch_sf_data(statuses, keywords, max_built_year):
 
     # Combine street fields for a cleaner address
     df_permits['address'] = df_permits['street_number'].fillna('') + ' ' + df_permits['street_name'].fillna('') + ' ' + df_permits['street_suffix'].fillna('')
+    df_permits['address'] = df_permits['address'].str.strip().str.upper()
+
+    # Fetch Assessor Data for corresponding blocks
+    unique_blocks = df_permits['block'].dropna().unique().tolist()
+    block_filter = ", ".join(f"'{b}'" for b in unique_blocks)
+    
+    assessor_url = "https://data.sfgov.org/resource/wv5m-vpq2.json"
+    assessor_soql = (
+        f"$select=year_property_built,block,lot"
+        f"&$where=block IN ({block_filter}) AND year_property_built <= '{max_built_year}'"
+        f"&$limit=10000"
+    )
+    
+    try:
+        assessor_resp = requests.get(f"{assessor_url}?{assessor_soql}")
+        assessor_resp.raise_for_status()
+        df_assessor = pd.DataFrame(assessor_resp.json())
+    except Exception as e:
+        st.error(f"Error fetching assessor data: {e}")
+        return pd.DataFrame()
+
+    if df_assessor.empty:
+        return pd.DataFrame()
+
+    # Merge data sets
+    merged_df = pd.merge(df_permits, df_assessor, on=['block', 'lot'], how='inner')
+    return merged_df
+
+# --- MAIN SCREEN DISPLAY ---
+if st.sidebar.button("Run Search / Refresh Data"):
+    with st.spinner("Querying DataSF Open Data APIs..."):
+        results_df = fetch_sf_data(selected_statuses, keyword_list, target_year)
+        
+        if not results_df.empty:
+            # Clean up and format dates (removing the 'T00:00:00.000' string from API)
+            if 'filed_date' in results_df.columns:
+                results_df['filed_date'] = pd.to_datetime(results_df['filed_date']).dt.strftime('%Y-%m-%d')
+            if 'issued_date' in results_df.columns:
+                results_df['issued_date'] = pd.to_datetime(results_df['issued_date']).dt.strftime('%Y-%m-%d')
+                results_df['issued_date'] = results_df['issued_date'].fillna('Not Yet Issued')
+
+            # --- DEDUPLICATION LOGIC ---
+            # 1. Sort by filed_date descending so the newest application is first
+            results_df = results_df.sort_values(by='filed_date', ascending=False)
+            
+            # 2. Keep only the first instance of each address
+            results_df = results_df.drop_duplicates(subset=['address'], keep='first')
+
+            # Clean up display columns map
+            display_df = results_df[[
+                'permit_number', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'description', 'block', 'lot'
+            ]].rename(columns={
+                'permit_number': 'Permit #',
+                'status': 'Status',
+                'address': 'Property Address',
+                'filed_date': 'Date Filed',
+                'issued_date': 'Date Issued',
+                'year_property_built': 'Year Built',
+                'description': 'Permit Description'
+            })
+            
+            # KPI Metrics
+            col1, col2 = st.columns(2)
+            col1.metric("Unique Properties Found", len(display_df))
+            col2.metric("Target Year Threshold", f"Built ≤ {target_year}")
+            
+            st.markdown("---")
+            
+            # Interactive Data Table
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            
+            # Download capability
+            csv = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Unique Results as CSV",
+                data=csv,
+                file_name=f"sf_unique_historic_demolitions_{target_year}.csv",
+                mime='text/csv',
+            )
+        else:
+            st.info("No properties matched your current filter criteria.")
+else:
+    st.info("Adjust the sidebar filters as needed and click **'Run Search / Refresh Data'** to pull the latest public records.")
+
     df_permits['address'] = df_permits['address'].str.strip()
 
     # Fetch Assessor Data for corresponding blocks
