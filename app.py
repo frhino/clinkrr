@@ -13,7 +13,7 @@ st.sidebar.header("Filter Criteria")
 
 # 1. Age Filter (Dynamic based on current year 2026)
 current_year = 2026
-max_age = st.sidebar.number_input("Minimum Building Age (Years)", min_value=1, max_value=200, value=100)
+max_age = st.sidebar.number_input("Minimum Building Age (Years)", min_value=1, max_value=200, value=50)
 target_year = current_year - max_age
 
 # 2. Material/Keyword Filter
@@ -27,16 +27,22 @@ selected_statuses = st.sidebar.multiselect("Permit Statuses", options=status_opt
 # --- DATA FETCHING & PROCESSING ---
 @st.cache_data(ttl=3600)  # Cache data for 1 hour
 def fetch_sf_data(statuses, keywords, max_built_year):
-    # Fetch Demolition Permits
-    permits_url = "https://data.sfgov.org/resource/i98e-djp9.json"
-    status_str = ", ".join(f"'{s}'" for s in statuses)
-    
     if not statuses:
         return pd.DataFrame()
 
+    permits_url = "https://data.sfgov.org/resource/i98e-djp9.json"
+    status_str = ", ".join(f"'{s}'" for s in statuses)
+    
+    # CRITICAL FIX 1: Filter text directly inside the Socrata API where-clause
+    where_clause = f"permit_type_definition='demolitions' AND status IN ({status_str})"
+    if keywords:
+        keyword_clauses = [f"lower(description) like '%{k}%'" for k in keywords]
+        where_clause += f" AND ({' OR '.join(keyword_clauses)})"
+
     permits_soql = (
         f"$select=permit_number,status,description,block,lot,filed_date,issued_date,street_number,street_name,street_suffix"
-        f"&$where=permit_type_definition='demolitions' AND status IN ({status_str})"
+        f"&$where={where_clause}"
+        f"&$order=filed_date DESC"
         f"&$limit=2000"
     )
     
@@ -51,27 +57,28 @@ def fetch_sf_data(statuses, keywords, max_built_year):
     if df_permits.empty:
         return df_permits
 
-    # Filter by keywords in description
-    if keywords:
-        pattern = '|'.join(keywords)
-        df_permits = df_permits[df_permits['description'].str.lower().str.contains(pattern, na=False)]
-
-    if df_permits.empty:
-        return df_permits
-
-    # Combine street fields for a cleaner address
+    # Combine street fields for a cleaner address mapping
     df_permits['address'] = df_permits['street_number'].fillna('') + ' ' + df_permits['street_name'].fillna('') + ' ' + df_permits['street_suffix'].fillna('')
     df_permits['address'] = df_permits['address'].str.strip().str.upper()
 
-    # Fetch Assessor Data for corresponding blocks
+    # CRITICAL FIX 2: Normalize permit block/lot text to fix padding mismatches
+    df_permits['join_block'] = df_permits['block'].astype(str).str.strip().str.lstrip('0').str.upper()
+    df_permits['join_lot'] = df_permits['lot'].astype(str).str.strip().str.lstrip('0').str.upper()
+
+    # Match the zero-padded format of the Assessor dataset (e.g. '0045')
     unique_blocks = df_permits['block'].dropna().unique().tolist()
-    block_filter = ", ".join(f"'{b}'" for b in unique_blocks)
+    padded_blocks = [str(b).strip().zfill(4) for b in unique_blocks]
+    
+    # Prevent multi-line string query errors if there are too many items
+    if len(padded_blocks) > 400:
+        padded_blocks = padded_blocks[:400]
+    block_filter = ", ".join(f"'{b}'" for b in padded_blocks)
     
     assessor_url = "https://data.sfgov.org/resource/wv5m-vpq2.json"
     assessor_soql = (
         f"$select=year_property_built,block,lot"
         f"&$where=block IN ({block_filter}) AND year_property_built <= '{max_built_year}'"
-        f"&$limit=10000"
+        f"&$limit=15000"
     )
     
     try:
@@ -85,8 +92,19 @@ def fetch_sf_data(statuses, keywords, max_built_year):
     if df_assessor.empty:
         return pd.DataFrame()
 
-    # Merge data sets
-    merged_df = pd.merge(df_permits, df_assessor, on=['block', 'lot'], how='inner')
+    # Normalize Assessor dataset keys to strip out padding zeros
+    df_assessor['join_block'] = df_assessor['block'].astype(str).str.strip().str.lstrip('0').str.upper()
+    df_assessor['join_lot'] = df_assessor['lot'].astype(str).str.strip().str.lstrip('0').str.upper()
+
+    # Run the dataset join on the normalized tracking keys
+    merged_df = pd.merge(df_permits, df_assessor, on=['join_block', 'join_lot'], how='inner')
+    
+    if not merged_df.empty:
+        if 'block_x' in merged_df.columns:
+            merged_df['block'] = merged_df['block_x']
+        if 'lot_x' in merged_df.columns:
+            merged_df['lot'] = merged_df['lot_x']
+            
     return merged_df
 
 # --- MAIN SCREEN DISPLAY ---
@@ -95,14 +113,13 @@ if st.sidebar.button("Run Search / Refresh Data"):
         results_df = fetch_sf_data(selected_statuses, keyword_list, target_year)
         
         if not results_df.empty:
-            # --- API SAFEGUARD ---
-            # Force guarantee that all columns exist, even if the API omitted them
+            # Column mapping check for safe rendering
             expected_cols = ['permit_number', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'description', 'block', 'lot']
             for col in expected_cols:
                 if col not in results_df.columns:
                     results_df[col] = None
 
-            # Clean up and format dates safely
+            # Clean up and format date objects
             try:
                 results_df['filed_date'] = pd.to_datetime(results_df['filed_date']).dt.strftime('%Y-%m-%d')
             except:
@@ -115,11 +132,11 @@ if st.sidebar.button("Run Search / Refresh Data"):
                 pass
             results_df['issued_date'] = results_df['issued_date'].fillna('Not Yet Issued')
 
-            # --- DEDUPLICATION LOGIC ---
+            # Deduplicate by unique address, keeping the newest entry
             results_df = results_df.sort_values(by='filed_date', ascending=False)
             results_df = results_df.drop_duplicates(subset=['address'], keep='first')
 
-            # Clean up display columns map
+            # Clean up data grid headers
             display_df = results_df[[
                 'permit_number', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'description', 'block', 'lot'
             ]].rename(columns={
@@ -132,17 +149,17 @@ if st.sidebar.button("Run Search / Refresh Data"):
                 'description': 'Permit Description'
             })
             
-            # KPI Metrics
+            # KPI Summary Metrics
             col1, col2 = st.columns(2)
             col1.metric("Unique Properties Found", len(display_df))
             col2.metric("Target Year Threshold", f"Built ≤ {target_year}")
             
             st.markdown("---")
             
-            # Interactive Data Table
+            # Interactive Grid View
             st.dataframe(display_df, use_container_width=True, hide_index=True)
             
-            # Download capability
+            # File Exporter Component
             csv = display_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Unique Results as CSV",
@@ -154,5 +171,4 @@ if st.sidebar.button("Run Search / Refresh Data"):
             st.info("No properties matched your current filter criteria.")
 else:
     st.info("Adjust the sidebar filters as needed and click **'Run Search / Refresh Data'** to pull the latest public records.")
-
 
