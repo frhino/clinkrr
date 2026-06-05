@@ -95,18 +95,28 @@ if st.sidebar.button("Run Search / Refresh Data"):
         results_df = fetch_sf_data(selected_statuses, keyword_list, target_year)
         
         if not results_df.empty:
-            # Clean up and format dates (removing the 'T00:00:00.000' string from API)
-            if 'filed_date' in results_df.columns:
+            # --- API SAFEGUARD ---
+            # Force guarantee that all columns exist, even if the API omitted them
+            expected_cols = ['permit_number', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'description', 'block', 'lot']
+            for col in expected_cols:
+                if col not in results_df.columns:
+                    results_df[col] = None
+
+            # Clean up and format dates safely
+            try:
                 results_df['filed_date'] = pd.to_datetime(results_df['filed_date']).dt.strftime('%Y-%m-%d')
-            if 'issued_date' in results_df.columns:
+            except:
+                pass
+            results_df['filed_date'] = results_df['filed_date'].fillna('N/A')
+
+            try:
                 results_df['issued_date'] = pd.to_datetime(results_df['issued_date']).dt.strftime('%Y-%m-%d')
-                results_df['issued_date'] = results_df['issued_date'].fillna('Not Yet Issued')
+            except:
+                pass
+            results_df['issued_date'] = results_df['issued_date'].fillna('Not Yet Issued')
 
             # --- DEDUPLICATION LOGIC ---
-            # 1. Sort by filed_date descending so the newest application is first
             results_df = results_df.sort_values(by='filed_date', ascending=False)
-            
-            # 2. Keep only the first instance of each address
             results_df = results_df.drop_duplicates(subset=['address'], keep='first')
 
             # Clean up display columns map
