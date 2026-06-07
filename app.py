@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import requests
+import urllib.parse
 
 # Set up page configuration
 st.set_page_config(page_title="SF Historic Building Permit Tracker", layout="wide")
 
 st.title("🏛️ SF Universal Historic Permit Explorer")
-st.markdown("Search across **all** permit classifications filed in San Francisco for historical brick/masonry structures.")
+st.markdown("Search across all permit classifications. Click the **Google Maps** link in any row to instantly verify the building frame.")
 
 # --- SIDEBAR FILTERS ---
 st.sidebar.header("Filter Criteria")
@@ -40,17 +41,14 @@ def fetch_sf_data(statuses, filter_method, keywords, max_built_year):
     permits_url = "https://data.sfgov.org/resource/i98e-djp9.json"
     status_str = ", ".join(f"'{s}'" for s in statuses)
     
-    # Base condition: Only filter by status (All permit types are included now!)
     where_clause = f"status IN ({status_str})"
     
-    # Apply structural material filtering criteria
     if filter_method == "Type 3 Construction Only (Historic Masonry/Brick)":
         where_clause += " AND existing_construction_type = '3'"
     elif filter_method == "Keyword Text Search Only" and keywords:
         keyword_clauses = [f"lower(description) like '%{k}%'" for k in keywords]
         where_clause += f" AND ({' OR '.join(keyword_clauses)})"
     elif filter_method == "Both (Recommended)":
-        # Matches Type 3 construction OR text containing keywords
         sub_clauses = ["existing_construction_type = '3'"]
         if keywords:
             sub_clauses.extend([f"lower(description) like '%{k}%'" for k in keywords])
@@ -74,11 +72,9 @@ def fetch_sf_data(statuses, filter_method, keywords, max_built_year):
     if df_permits.empty:
         return df_permits
 
-    # Combine street fields for clean address formatting
     df_permits['address'] = df_permits['street_number'].fillna('') + ' ' + df_permits['street_name'].fillna('') + ' ' + df_permits['street_suffix'].fillna('')
     df_permits['address'] = df_permits['address'].str.strip().str.upper()
 
-    # Normalize structural matching IDs
     df_permits['join_block'] = df_permits['block'].astype(str).str.strip().str.lstrip('0').str.upper()
     df_permits['join_lot'] = df_permits['lot'].astype(str).str.strip().str.lstrip('0').str.upper()
 
@@ -110,7 +106,6 @@ def fetch_sf_data(statuses, filter_method, keywords, max_built_year):
     df_assessor['join_block'] = df_assessor['block'].astype(str).str.strip().str.lstrip('0').str.upper()
     df_assessor['join_lot'] = df_assessor['lot'].astype(str).str.strip().str.lstrip('0').str.upper()
 
-    # Merge datasets
     merged_df = pd.merge(df_permits, df_assessor, on=['join_block', 'join_lot'], how='inner')
     
     if not merged_df.empty:
@@ -127,13 +122,11 @@ if st.sidebar.button("Run Search / Refresh Data"):
         results_df = fetch_sf_data(selected_statuses, construction_filter, keyword_list, target_year)
         
         if not results_df.empty:
-            # Fallback column checker
             expected_cols = ['permit_number', 'permit_type_definition', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'existing_construction_type_description', 'description', 'block', 'lot']
             for col in expected_cols:
                 if col not in results_df.columns:
                     results_df[col] = None
 
-            # Standardize dates
             try:
                 results_df['filed_date'] = pd.to_datetime(results_df['filed_date']).dt.strftime('%Y-%m-%d')
             except:
@@ -146,22 +139,27 @@ if st.sidebar.button("Run Search / Refresh Data"):
                 pass
             results_df['issued_date'] = results_df['issued_date'].fillna('Not Yet Issued')
 
-            # Sort and deduplicate by address
             results_df = results_df.sort_values(by='filed_date', ascending=False)
             results_df = results_df.drop_duplicates(subset=['address'], keep='first')
 
-            # Reformat output dataframe layout
+            # CRITICAL FIX: Generate a clean Google Maps search URL for every unique address
+            results_df['maps_url'] = results_df['address'].apply(
+                lambda addr: f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(f'{addr}, San Francisco, CA')}"
+            )
+
+            # Reformat layout to include the new maps_url column
             display_df = results_df[[
-                'permit_number', 'permit_type_definition', 'status', 'address', 'filed_date', 'issued_date', 'year_property_built', 'existing_construction_type_description', 'description', 'block', 'lot'
+                'maps_url', 'address', 'year_property_built', 'existing_construction_type_description', 'permit_number', 'permit_type_definition', 'status', 'filed_date', 'issued_date', 'description'
             ]].rename(columns={
+                'maps_url': 'Google Maps',
+                'address': 'Property Address',
+                'year_property_built': 'Year Built',
+                'existing_construction_type_description': 'Frame Class',
                 'permit_number': 'Permit #',
                 'permit_type_definition': 'Permit Classification',
                 'status': 'Status',
-                'address': 'Property Address',
                 'filed_date': 'Date Filed',
                 'issued_date': 'Date Issued',
-                'year_property_built': 'Year Built',
-                'existing_construction_type_description': 'Frame Class',
                 'description': 'Permit Description'
             })
             
@@ -172,8 +170,18 @@ if st.sidebar.button("Run Search / Refresh Data"):
             
             st.markdown("---")
             
-            # Render grid map table
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            # Render grid table with an explicit Link Column setup
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Google Maps": st.column_config.LinkColumn(
+                        label="View Street View",
+                        display_text="🌐 Open Maps"
+                    )
+                }
+            )
             
             # Exporter setup
             csv = display_df.to_csv(index=False).encode('utf-8')
@@ -184,6 +192,6 @@ if st.sidebar.button("Run Search / Refresh Data"):
                 mime='text/csv',
             )
         else:
-            st.info("No records found matching your specified timeline and structural parameters.")
+            st.info("No records found matching your specified parameters.")
 else:
-    st.info("Adjust parameters in the sidebar panel and click **'Run Search / Refresh Data'** to scan the entire municipal catalog.")
+    st.info("Adjust parameters in the sidebar panel and click **'Run Search / Refresh Data'**.")
